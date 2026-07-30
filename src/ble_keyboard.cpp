@@ -4,6 +4,7 @@
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include <atomic>
 
 // HID service and characteristic UUIDs
 static NimBLEUUID hidServiceUUID("1812");
@@ -51,7 +52,7 @@ static constexpr uint32_t DEVICE_STALE_MS = 10000;  // 10 seconds - reduced to p
 
 // FreeRTOS connect task
 static TaskHandle_t connectTaskHandle = nullptr;
-static volatile bool authSuccess = false;
+static std::atomic<bool> authSuccess{false};
 
 // How many consecutive auth/HID setup failures before we clear the stale bond.
 // A physical-connect failure (keyboard out of range) does not count.
@@ -62,7 +63,7 @@ static constexpr int BOND_CLEAR_THRESHOLD = 2;
 static constexpr uint32_t CONNECT_TIMEOUT_MS = 10000;
 
 // Global variable to store the passkey for display
-static uint32_t currentPasskey = 0;
+static std::atomic<uint32_t> currentPasskey{0};
 
 // Deferred connection parameter update (needed for L2CAP requests).
 // NimBLE sends the L2CAP acceptance response but does NOT issue the HCI
@@ -71,11 +72,13 @@ static uint32_t currentPasskey = 0;
 // keyboard disconnects.  We queue the update here and apply it from
 // bleLoop() so we can safely call updateConnParams() outside the NimBLE
 // event handler context.
-static volatile bool     pendingConnParamUpdate  = false;
-static volatile uint16_t pendingConnParamMin     = 0;
-static volatile uint16_t pendingConnParamMax     = 0;
-static volatile uint16_t pendingConnParamLatency = 0;
-static volatile uint16_t pendingConnParamTimeout = 0;
+// std::atomic provides the necessary memory-ordering guarantees between
+// the NimBLE BT task (core 0) and bleLoop() on the Arduino task (core 1).
+static std::atomic<bool>     pendingConnParamUpdate{false};
+static std::atomic<uint16_t> pendingConnParamMin{0};
+static std::atomic<uint16_t> pendingConnParamMax{0};
+static std::atomic<uint16_t> pendingConnParamLatency{0};
+static std::atomic<uint16_t> pendingConnParamTimeout{0};
 
 // Forward declarations
 static bool setupHidConnection();
