@@ -199,13 +199,21 @@ static class ClientCallbacks : public NimBLEClientCallbacks {
 
   bool onConnParamsUpdateRequest(NimBLEClient* pClient,
                                   const ble_gap_upd_params* params) override {
-    // Reject the keyboard's connection parameter update request.
-    // Keychron keyboards send a conn param update on the first keypress (idle→active
-    // interval switch). Returning true makes NimBLE substitute our m_connParams into
-    // the response, which mismatches what the Keychron expects and causes an immediate
-    // crash/disconnect. Returning false tells the keyboard to keep the current params
-    // (30–50 ms interval negotiated at connect time), which works fine for all keyboards.
-    return false;
+    // Accept the keyboard's connection parameter update request by mirroring its
+    // requested params back as our own.  NimBLE responds with m_connParams, so we
+    // must first copy the peer's values in — that way the response echoes exactly
+    // what the keyboard asked for and no mismatch occurs.
+    //
+    // Previously this returned false (reject) to work around a Keychron crash, but
+    // the crash was caused by the stored m_connParams differing from what Keychron
+    // requested — not by acceptance itself.  Echoing the peer's own params fixes
+    // 8BitDo (which disconnects when its first-keypress param update is rejected)
+    // while remaining safe for Keychron and other keyboards.
+    pClient->setConnectionParams(params->itvl_min,
+                                  params->itvl_max,
+                                  params->latency,
+                                  params->supervision_timeout);
+    return true;
   }
 
   // Security callbacks (merged from NimBLESecurityCallbacks — removed in 2.x)
