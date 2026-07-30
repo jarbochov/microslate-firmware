@@ -64,6 +64,19 @@ static constexpr uint32_t CONNECT_TIMEOUT_MS = 10000;
 // Global variable to store the passkey for display
 static uint32_t currentPasskey = 0;
 
+// Deferred connection parameter update (needed for L2CAP requests).
+// NimBLE sends the L2CAP acceptance response but does NOT issue the HCI
+// LE Connection Update command for BLE_GAP_EVENT_L2CAP_UPDATE_REQ.  The
+// keyboard expects the central to follow through; if it doesn't, the
+// keyboard disconnects.  We queue the update here and apply it from
+// bleLoop() so we can safely call updateConnParams() outside the NimBLE
+// event handler context.
+static volatile bool     pendingConnParamUpdate  = false;
+static volatile uint16_t pendingConnParamMin     = 0;
+static volatile uint16_t pendingConnParamMax     = 0;
+static volatile uint16_t pendingConnParamLatency = 0;
+static volatile uint16_t pendingConnParamTimeout = 0;
+
 // Forward declarations
 static bool setupHidConnection();
 int getLastUsedKeyboardIndex();
@@ -194,25 +207,30 @@ static class ClientCallbacks : public NimBLEClientCallbacks {
     authSuccess = false;
     memset(lastReport, 0, 8);
     lastReconnectAttempt = millis();
+    pendingConnParamUpdate = false;  // Discard any pending parameter update
     DBG_PRINTF("[BLE] Disconnected (reason=0x%02X)\n", reason);
   }
 
   bool onConnParamsUpdateRequest(NimBLEClient* pClient,
                                   const ble_gap_upd_params* params) override {
-    // Accept the keyboard's connection parameter update request by mirroring its
-    // requested params back as our own.  NimBLE responds with m_connParams, so we
-    // must first copy the peer's values in — that way the response echoes exactly
-    // what the keyboard asked for and no mismatch occurs.
-    //
-    // Previously this returned false (reject) to work around a Keychron crash, but
-    // the crash was caused by the stored m_connParams differing from what Keychron
-    // requested — not by acceptance itself.  Echoing the peer's own params fixes
-    // 8BitDo (which disconnects when its first-keypress param update is rejected)
-    // while remaining safe for Keychron and other keyboards.
+    // Always mirror the keyboard's requested values into m_connParams so that
+    // NimBLE can use them when filling self_params for LLCP updates.
     pClient->setConnectionParams(params->itvl_min,
                                   params->itvl_max,
                                   params->latency,
                                   params->supervision_timeout);
+    // Queue a deferred updateConnParams() to handle L2CAP update requests.
+    // For BLE_GAP_EVENT_L2CAP_UPDATE_REQ, NimBLE only sends the L2CAP
+    // acceptance response — it does NOT issue the HCI LE Connection Update
+    // command.  The keyboard waits for that command and disconnects if it
+    // never arrives.  Applying the update from bleLoop() (outside the event
+    // handler) is safe; for LLCP requests the call is a harmless no-op
+    // because the controller already has the new params in flight.
+    pendingConnParamMin     = params->itvl_min;
+    pendingConnParamMax     = params->itvl_max;
+    pendingConnParamLatency = params->latency;
+    pendingConnParamTimeout = params->supervision_timeout;
+    pendingConnParamUpdate  = true;
     return true;
   }
 
@@ -298,6 +316,16 @@ static bool setupHidConnection() {
             pInputReportChar = chr;
             inputReportId = (uint8_t)refData[0];  // 0 = no ID prefix, non-zero = ID byte present
             DBG_PRINTF("[BLE]     -> Selected as input report (reportId=%d)\n", inputReportId);
+            // Subscribe now while we have the report reference info.
+            // The final block below only handles the boot-keyboard fallback,
+            // so we must subscribe here or notifications will never arrive.
+            if (!pInputReportChar->subscribe(true, onKeyboardNotify)) {
+              DBG_PRINTLN("[BLE]     Subscribe failed — clearing, will use fallback");
+              pInputReportChar = nullptr;
+              inputReportId = 0;
+            } else {
+              DBG_PRINTF("[BLE]     Subscribed via report reference (reportId=%d)\n", inputReportId);
+            }
             break;
           }
         }
@@ -687,6 +715,29 @@ void bleLoop() {
     // Trigger screen refresh to show final results
     extern bool screenDirty;
     screenDirty = true;
+  }
+
+  // Apply any deferred connection parameter update queued by onConnParamsUpdateRequest.
+  // When the keyboard sends a BLE_GAP_EVENT_L2CAP_UPDATE_REQ, NimBLE sends the L2CAP
+  // acceptance response but does NOT issue the HCI LE Connection Update command.
+  // The keyboard waits for that HCI update; if it never arrives it disconnects.
+  // updateConnParams() issues the actual HCI command.  For LLCP requests the call
+  // returns false (harmless — params already applied at the controller level).
+  if (pendingConnParamUpdate && bleState == BLEState::CONNECTED &&
+      pClient && pClient->isConnected()) {
+    // Snapshot and clear the flag first so a rapid disconnect/reconnect cycle
+    // doesn't leave stale params pending.
+    uint16_t iMin = pendingConnParamMin;
+    uint16_t iMax = pendingConnParamMax;
+    uint16_t lat  = pendingConnParamLatency;
+    uint16_t tout = pendingConnParamTimeout;
+    pendingConnParamUpdate = false;
+    if (pClient->updateConnParams(iMin, iMax, lat, tout)) {
+      DBG_PRINTF("[BLE] Applied deferred conn param update (itvl %d-%d lat=%d tout=%d)\n",
+                 iMin, iMax, lat, tout);
+    } else {
+      DBG_PRINTLN("[BLE] updateConnParams() skipped — LLCP update already in progress (normal)");
+    }
   }
 
   // Launch connect task if requested (non-blocking)
