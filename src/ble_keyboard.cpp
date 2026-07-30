@@ -53,6 +53,11 @@ static constexpr uint32_t DEVICE_STALE_MS = 10000;  // 10 seconds - reduced to p
 static TaskHandle_t connectTaskHandle = nullptr;
 static volatile bool authSuccess = false;
 
+// How many consecutive auth/HID setup failures before we clear the stale bond.
+// A physical-connect failure (keyboard out of range) does not count.
+static int consecutiveConnectFailures = 0;
+static constexpr int BOND_CLEAR_THRESHOLD = 2;
+
 // Connection timeout in seconds
 static constexpr uint32_t CONNECT_TIMEOUT_MS = 10000;
 
@@ -95,11 +100,18 @@ static void onKeyboardNotify(NimBLERemoteCharacteristic* pRemChar,
     length--;
   }
 
-  // Must be 7 or 8 bytes after stripping. Consumer-control / media-key reports
+  // Must be at least 7 bytes after stripping. Consumer-control / media-key reports
   // from other report IDs arrive here too — silently ignore them.
-  if (length < 7 || length > 8) {
-    DBG_PRINTF("[KB-Notify] Ignoring %d-byte report (not keyboard format)\n", (int)length);
+  // Reports longer than 8 bytes (e.g. NKRO or composite reports from keyboards like
+  // 8BitDo) are parsed using the first 8 bytes as a standard keyboard report rather
+  // than being discarded, improving compatibility without breaking existing keyboards.
+  if (length < 7) {
+    DBG_PRINTF("[KB-Notify] Ignoring %d-byte report (too short for keyboard format)\n", (int)length);
     return;
+  }
+  if (length > 8) {
+    DBG_PRINTF("[KB-Notify] %d-byte report — clamping to 8 bytes for standard keyboard parsing\n", (int)length);
+    length = 8;
   }
 
   uint8_t modifiers = pData[0];
@@ -182,7 +194,7 @@ static class ClientCallbacks : public NimBLEClientCallbacks {
     authSuccess = false;
     memset(lastReport, 0, 8);
     lastReconnectAttempt = millis();
-    DBG_PRINTLN("[BLE] Disconnected");
+    DBG_PRINTF("[BLE] Disconnected (reason=0x%02X)\n", reason);
   }
 
   bool onConnParamsUpdateRequest(NimBLEClient* pClient,
@@ -374,12 +386,22 @@ static void bleConnectTask(void* param) {
 
   // Step 1: Connect (blocks this task, main loop continues)
   NimBLEAddress addr(keyboardAddress, keyboardAddressType);
-  // Delete any stored bond before connecting — forces a fresh "Just Works" pairing
-  // instead of an encrypted reconnect. Prevents a NimBLE security-state crash when
-  // the keyboard still holds a stale connection from a previous unclean disconnect.
-  NimBLEDevice::deleteBond(addr);
+  // Only clear a stale bond after repeated auth/HID setup failures — not on every
+  // connect attempt. Unconditional deletion breaks BLE-privacy / rotating-address
+  // keyboards (e.g. 8BitDo Retro) that rely on a persistent bonded relationship for
+  // address resolution and re-encryption. The bond is preserved for normal reconnects;
+  // recovery from genuine stale-security-state still happens after BOND_CLEAR_THRESHOLD
+  // consecutive failures.
+  if (consecutiveConnectFailures >= BOND_CLEAR_THRESHOLD) {
+    DBG_PRINTF("[BLE-Task] %d consecutive auth/HID failures — clearing stale bond as recovery\n",
+               consecutiveConnectFailures);
+    NimBLEDevice::deleteBond(addr);
+    consecutiveConnectFailures = 0;
+  }
   if (!pClient->connect(addr, true)) {
     DBG_PRINTLN("[BLE-Task] Connection failed");
+    // Physical connect failure (keyboard out of range) does not count as an
+    // auth/HID failure, so we do not increment consecutiveConnectFailures here.
     bleState = BLEState::DISCONNECTED;
     connectTaskHandle = nullptr;
     vTaskDelete(NULL);
@@ -401,8 +423,11 @@ static void bleConnectTask(void* param) {
 
     if (authSuccess) {
       DBG_PRINTLN("[BLE-Task] Security succeeded");
+      consecutiveConnectFailures = 0;  // Reset on auth success
     } else {
-      DBG_PRINTLN("[BLE-Task] Security failed/timeout - trying HID anyway");
+      consecutiveConnectFailures++;
+      DBG_PRINTF("[BLE-Task] Security failed/timeout (%d/%d before bond clear) - trying HID anyway\n",
+                 consecutiveConnectFailures, BOND_CLEAR_THRESHOLD);
     }
   } else {
     DBG_PRINTLN("[BLE-Task] secureConnection() returned false - trying HID anyway");
@@ -412,7 +437,9 @@ static void bleConnectTask(void* param) {
 
   // Step 4: Service discovery + HID subscription (blocks this task)
   if (!setupHidConnection()) {
-    DBG_PRINTLN("[BLE-Task] HID setup failed, disconnecting");
+    consecutiveConnectFailures++;
+    DBG_PRINTF("[BLE-Task] HID setup failed (%d/%d before bond clear), disconnecting\n",
+               consecutiveConnectFailures, BOND_CLEAR_THRESHOLD);
     if (pClient->isConnected()) pClient->disconnect();
     bleState = BLEState::DISCONNECTED;
     connectTaskHandle = nullptr;
@@ -424,6 +451,7 @@ static void bleConnectTask(void* param) {
   // Do this BEFORE storePairedDevice (NVS write) to minimise the window where the link
   // is live but bleState is still CONNECTING.
   bleState = BLEState::CONNECTED;
+  consecutiveConnectFailures = 0;  // Full success — reset failure counter
   reconnectDelay = 5000;  // Reset backoff after successful connection
   bleConnIdleMode = false;
   lastBleKeystrokeMs = millis();  // Start the 3s idle timer from now, not from boot
