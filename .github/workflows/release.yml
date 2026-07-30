@@ -55,10 +55,8 @@ jobs:
               0xe000   "$BOOT_APP0" \
               0x10000  crosspoint-app.bin \
               0x650000 .pio/build/xteink_x4/firmware.bin
-            echo "DUALBOOT_BUILT=true" >> $GITHUB_ENV
           else
             echo "CrossPoint app.bin not on website yet, skipping dual-boot build"
-            echo "DUALBOOT_BUILT=false" >> $GITHUB_ENV
           fi
 
       - name: Create release
@@ -69,24 +67,3 @@ jobs:
             dualboot-${{ github.ref_name }}.bin
           fail_on_unmatched_files: false
           generate_release_notes: true
-
-      - name: Update firmware on typeslate website
-        env:
-          WEBSITE_PAT: ${{ secrets.WEBSITE_PAT }}
-        run: |
-          git clone https://x-access-token:${WEBSITE_PAT}@github.com/josh-websites/typeslate-website.git website
-          cp microslate-${{ github.ref_name }}.bin website/tools/microslate/firmware/latest.bin
-          echo '{"version":"${{ github.ref_name }}"}' > website/tools/microslate/firmware/version.json
-
-          if [ "$DUALBOOT_BUILT" = "true" ]; then
-            cp dualboot-${{ github.ref_name }}.bin website/tools/microslate/firmware/dualboot-latest.bin
-            echo '{"version":"${{ github.ref_name }}"}' > website/tools/microslate/firmware/dualboot-version.json
-            git -C website add tools/microslate/firmware/dualboot-latest.bin tools/microslate/firmware/dualboot-version.json
-          fi
-
-          cd website
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add tools/microslate/firmware/latest.bin tools/microslate/firmware/version.json
-          git commit -m "Update MicroSlate firmware to ${{ github.ref_name }}"
-          git push
