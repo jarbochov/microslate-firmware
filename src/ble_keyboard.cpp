@@ -724,22 +724,34 @@ void bleLoop() {
   // When the keyboard sends a BLE_GAP_EVENT_L2CAP_UPDATE_REQ, NimBLE sends the L2CAP
   // acceptance response but does NOT issue the HCI LE Connection Update command.
   // The keyboard waits for that HCI update; if it never arrives it disconnects.
-  // updateConnParams() issues the actual HCI command.  For LLCP requests the call
-  // returns false (harmless — params already applied at the controller level).
-  if (pendingConnParamUpdate && bleState == BLEState::CONNECTED &&
+  // updateConnParams() issues the actual HCI command.
+  //
+  // Two important subtleties vs. the naive approach:
+  //
+  // 1. The guard is relaxed to bleState != DISCONNECTED (not == CONNECTED) so the
+  //    update fires even during service discovery (CONNECTING state).  The 8BitDo
+  //    often sends its L2CAP request while HID setup is blocking on ATT reads.
+  //    Waiting until bleState = CONNECTED (set only after setupHidConnection()
+  //    returns) can exceed the keyboard's HCI-update timeout, causing a disconnect.
+  //
+  // 2. pendingConnParamUpdate is cleared ONLY on success.  ble_gap_update_params()
+  //    can return BLE_HS_EALREADY if another LE procedure is briefly in flight
+  //    right after connecting (e.g., MTU exchange or a concurrent LLCP).  In that
+  //    case we retry on the next loop iteration instead of silently dropping the
+  //    update.  onDisconnect() already clears the flag if the link drops before
+  //    we succeed, so there is no stale-state risk.
+  if (pendingConnParamUpdate && bleState != BLEState::DISCONNECTED &&
       pClient && pClient->isConnected()) {
-    // Snapshot and clear the flag first so a rapid disconnect/reconnect cycle
-    // doesn't leave stale params pending.
     uint16_t iMin = pendingConnParamMin;
     uint16_t iMax = pendingConnParamMax;
     uint16_t lat  = pendingConnParamLatency;
     uint16_t tout = pendingConnParamTimeout;
-    pendingConnParamUpdate = false;
     if (pClient->updateConnParams(iMin, iMax, lat, tout)) {
+      pendingConnParamUpdate = false;
       DBG_PRINTF("[BLE] Applied deferred conn param update (itvl %d-%d lat=%d tout=%d)\n",
                  iMin, iMax, lat, tout);
     } else {
-      DBG_PRINTLN("[BLE] updateConnParams() skipped — LLCP update already in progress (normal)");
+      DBG_PRINTLN("[BLE] updateConnParams() busy, will retry next loop...");
     }
   }
 
